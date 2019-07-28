@@ -1,6 +1,8 @@
 // Martin Kersner, m.kersner@gmail.com
 // 2017/04/21
 
+#include <string.h>
+#include <map>
 #include "gtop.hh"
 
 std::mutex m;
@@ -11,11 +13,124 @@ bool processed = false;
 bool ready     = false;
 bool finished  = false;
 
-int main() {	
+static jetson_version tegra_chip_id;
+
+static const std::map<std::string, int> TK1cpuIdxMap = {};
+static const std::map<std::string, int> TK1gpuIdxMap = {};
+static const std::map<std::string, int> TX1cpuIdxMap = { std::make_pair ("28-1.0", 5) };
+static const std::map<std::string, int> TX1gpuIdxMap = { std::make_pair ("28-1.0", 7) };
+static const std::map<std::string, int> TX2cpuIdxMap = { std::make_pair ("28-2.1", 5) };
+static const std::map<std::string, int> TX2gpuIdxMap = { std::make_pair ("28-2.1", 9) };
+
+static int cpuStatsIdx;
+static int gpuStatsIdx;
+
+
+
+int main() {
   if (getuid()) {
     std::cout << "gtop requires root privileges!" << std::endl;
     exit(1);
   }
+
+  /* Identify the jetson we're running on */
+  char jetsonIdStr[3];
+  FILE* fid = fopen ("/sys/module/tegra_fuse/parameters/tegra_chip_id", "r");
+  if (!fid) {
+          std::cerr << "Error: failed to open /sys/module/tegra_fuse/parameters/tegra_chip_id" << std::endl;
+  }
+  int readBytes = fread(jetsonIdStr, 1, 2, fid);
+  if (readBytes != 2) {
+	  std::cerr << "Error: failed to read /sys/module/tegra_fuse/parameters/tegra_chip_id" << std::endl;
+  }
+  fclose(fid);
+  jetsonIdStr[2]=0;
+  if (!strcmp(jetsonIdStr, "24"))
+	tegra_chip_id = TX2;
+  else if (!strcmp(jetsonIdStr, "33"))
+	tegra_chip_id = TX1;
+  else if (!strcmp(jetsonIdStr, "64"))
+	tegra_chip_id = TK1;
+  else {
+	std::cerr << "Error: unsupported Jetson with code " << jetsonIdStr << std::endl;
+	exit (-2);
+  }
+
+
+  /* Get L4T version */
+  char l4tStr[32];
+  fid = fopen ("/etc/nv_tegra_release", "r");
+  if (!fid) {
+	  std::cerr << "Error: failed to open /etc/nv_tegra_release" << std::endl;
+  }
+  readBytes = fread(l4tStr, 1, 32, fid);
+  if (readBytes != 32) {
+	  std::cerr << "Error: failed to read /etc/nv_tegra_release" << std::endl;
+  }
+  fclose(fid);
+
+  char l4t_version[8];
+  l4t_version[0] = l4tStr[3];
+  l4t_version[1] = l4tStr[4];
+  l4t_version[2] = '-';
+  l4t_version[3] = l4tStr[27];
+  l4t_version[4] = l4tStr[28];
+  l4t_version[5] = l4tStr[29];
+  l4t_version[6] = 0;
+  printf("Found L4T version %s\n", l4t_version);
+ 
+  std::map<std::string, int>::const_iterator it;
+  switch (tegra_chip_id) {
+	  case TX2:
+		it = TX2cpuIdxMap.find(l4t_version);
+		if (it == TX2cpuIdxMap.end()) {
+			std::cerr << "Error: CPU index undefined for L4T version " << l4t_version <<std::endl;
+			exit(-2);
+		}
+		cpuStatsIdx = (*it).second;
+		
+		it = TX2gpuIdxMap.find(l4t_version);
+		if (it == TX2gpuIdxMap.end()) {
+			std::cerr << "Error: GPU index undefined for L4T version " << l4t_version <<std::endl;
+			exit(-3);
+		}
+		gpuStatsIdx = (*it).second;
+		break;
+		
+	  case TX1:
+		it = TX1cpuIdxMap.find(l4t_version);
+		if (it == TX1cpuIdxMap.end()) {
+			std::cerr << "Error: CPU index undefined for L4T version " << l4t_version <<std::endl;
+			exit(-2);
+		}
+		cpuStatsIdx = (*it).second;
+		
+		it = TX1gpuIdxMap.find(l4t_version);
+		if (it == TX1gpuIdxMap.end()) {
+			std::cerr << "Error: GPU index undefined for L4T version " << l4t_version <<std::endl;
+			exit(-3);
+		}
+		gpuStatsIdx = (*it).second;
+		break;
+		
+	  case TK1:
+		it = TK1cpuIdxMap.find(l4t_version);
+		if (it == TK1cpuIdxMap.end()) {
+			std::cerr << "Error: CPU index undefined for L4T version " << l4t_version <<std::endl;
+			exit(-2);
+		}
+		cpuStatsIdx = (*it).second;
+		
+		it = TK1gpuIdxMap.find(l4t_version);
+		if (it == TK1gpuIdxMap.end()) {
+			std::cerr << "Error: GPU index undefined for L4T version " << l4t_version <<std::endl;
+			exit(-3);
+		}
+		gpuStatsIdx = (*it).second;
+		break;
+  }
+
+ 
 
   std::thread t(read_tegrastats); 
 
@@ -114,23 +229,25 @@ void read_tegrastats() {
 
 tegrastats parse_tegrastats(const char * buffer) {
   tegrastats ts;
+  ts.version = tegra_chip_id;
+  
   auto stats = tokenize(buffer, ' ');
 
-  if (stats.size() >= 15)
-    ts.version = TX1;
-  else
-    ts.version = TX2;
-
   get_mem_stats(ts, stats.at(1));
+  
+  int swap_offset = 0;
+  if (stats.at(4) == "SWAP") {
+	  swap_offset = 4;
+  }
 
   switch (ts.version) {
     case TX1:
-      get_cpu_stats_tx1(ts, stats.at(5));
-      get_gpu_stats(ts, stats.at(15));
+      get_cpu_stats_tx1(ts, stats.at(cpuStatsIdx + swap_offset));
+      get_gpu_stats(ts, stats.at(gpuStatsIdx + swap_offset));
       break;
     case TX2:
-      get_cpu_stats_tx2(ts, stats.at(5));
-      get_gpu_stats(ts, stats.at(13));
+      get_cpu_stats_tx2(ts, stats.at(cpuStatsIdx + swap_offset));
+      get_gpu_stats(ts, stats.at(gpuStatsIdx + swap_offset));
       break;
     case TK1: // TODO
       break;
